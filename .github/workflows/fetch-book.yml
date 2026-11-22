@@ -4,6 +4,9 @@ on:
     branches: [main]
     paths: ['book-trigger.txt']
 
+permissions:
+  contents: write
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
