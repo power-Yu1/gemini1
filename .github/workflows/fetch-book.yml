@@ -1,0 +1,19 @@
+name: Fetch Book
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download official files
+        run: |
+          curl -sL --retry 3 -o Inference_Engineering.pdf "https://simple-download.vercel.app/api/download/Inference%20Engineering.pdf?_hsenc=p2ANqtz--cEwFUpqbFDS_1-b0K0-SBDSZ-v_5HmVr3pZHc2xgCC9vGP3V4V9zfHjZH1JgXZbEKc92f2cJq2ylsFB9cNx7X9e0tUZK54KzcrjvZa0QOXFQMhg4&_hsmi=416411559"
+          curl -sL --retry 3 -o Inference_Engineering.epub "https://simple-download.vercel.app/api/download/Inference%20Engineering.epub?_hsenc=p2ANqtz--cEwFUpqbFDS_1-b0K0-SBDSZ-v_5HmVr3pZHc2xgCC9vGP3V4V9zfHjZH1JgXZbEKc92f2cJq2ylsFB9cNx7X9e0tUZK54KzcrjvZa0QOXFQMhg4&_hsmi=416411559"
+          ls -la
+          head -c 8 Inference_Engineering.pdf | od -c | head -1
+      - name: Create release with files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create book-v1 Inference_Engineering.pdf Inference_Engineering.epub --title "Inference Engineering" --notes "official downloads" || gh release upload book-v1 Inference_Engineering.pdf Inference_Engineering.epub --clobber
