@@ -1,6 +1,8 @@
 name: Fetch Book
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['book-trigger.txt']
 
 jobs:
   fetch:
