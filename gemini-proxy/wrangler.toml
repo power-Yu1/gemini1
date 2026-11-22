@@ -1,0 +1,10 @@
+name = "geminro"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+# 自定义域已在 Cloudflare 后台绑定：gemini.poweryugemini.dpdns.org
+# 部署后自动生效，无需在 wrangler 配置里声明 routes
+
+# GEMINI_API_KEY 用 Secret 方式设置（不进代码库）：
+#   npx wrangler secret put GEMINI_API_KEY
+# 或部署后在 Dashboard -> Worker -> Settings -> Variables 里添加
