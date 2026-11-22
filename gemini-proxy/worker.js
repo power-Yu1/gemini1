@@ -28,43 +28,195 @@ function errResp(status, message, type = 'proxy_error') {
   return jsonResp({ error: { message, type, code: status } }, status);
 }
 
-/** 从请求或环境取 Gemini key */
+/** 从请求或环境取 Gemini key：请求里只有真 key（AIza 开头）才采信，否则回落到 Worker 自己的机密 */
 function getKey(request, env) {
   const auth = request.headers.get('authorization');
   if (auth && auth.toLowerCase().startsWith('bearer ')) {
     const k = auth.slice(7).trim();
-    if (k && k !== 'none' && k !== 'null') return k;
+    if (k.startsWith('AIza')) return k;
   }
-  const xg = request.headers.get('x-goog-api-key');
-  if (xg) return xg.trim();
+  const xg = (request.headers.get('x-goog-api-key') || '').trim();
+  if (xg.startsWith('AIza')) return xg;
   if (env && env.GEMINI_API_KEY) return env.GEMINI_API_KEY;
   return null;
 }
 
-/** OpenAI messages -> Gemini contents + systemInstruction */
+/** 提取 OpenAI 文本内容（兼容字符串与多段数组） */
+function contentToText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    let out = '';
+    for (const p of content) {
+      if (!p) continue;
+      if (typeof p === 'string') out += p;
+      else if (typeof p.text === 'string') out += p.text;
+    }
+    return out;
+  }
+  return '';
+}
+
+/** 提取 OpenAI 用户内容为 Gemini parts（支持 data: 内联图片） */
+function contentToParts(content) {
+  if (typeof content === 'string') return content ? [{ text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  const parts = [];
+  for (const p of content) {
+    if (!p) continue;
+    if (typeof p === 'string') {
+      if (p) parts.push({ text: p });
+      continue;
+    }
+    if (typeof p.text === 'string' && p.text) {
+      parts.push({ text: p.text });
+      continue;
+    }
+    const url = p.image_url && (typeof p.image_url === 'string' ? p.image_url : p.image_url.url);
+    if (url && url.startsWith('data:')) {
+      const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+      if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
+    }
+  }
+  return parts;
+}
+
+/** Gemini 不支持的 JSON Schema 字段 */
+const SCHEMA_DROP = new Set(['$schema', '$id', '$ref', '$defs', 'definitions', 'additionalProperties', 'strict', 'title', 'examples', 'const', 'patternProperties', 'dependencies', 'if', 'then', 'else']);
+
+function cleanSchema(s) {
+  if (s === null || s === undefined) return { type: 'object', properties: {} };
+  if (Array.isArray(s)) return s.map(cleanSchema);
+  if (typeof s !== 'object') return s;
+  const out = {};
+  for (const key of Object.keys(s)) {
+    if (SCHEMA_DROP.has(key)) continue;
+    const v = s[key];
+    if (key === 'properties' && v && typeof v === 'object') {
+      const props = {};
+      for (const pk of Object.keys(v)) props[pk] = cleanSchema(v[pk]);
+      out.properties = props;
+    } else if (key === 'items') {
+      out.items = Array.isArray(v) ? cleanSchema(v[0] || { type: 'string' }) : cleanSchema(v);
+    } else if (key === 'anyOf' || key === 'oneOf') {
+      out.anyOf = (Array.isArray(v) ? v : []).map(cleanSchema);
+    } else if (key === 'enum') {
+      out.enum = (Array.isArray(v) ? v : []).map((x) => String(x));
+    } else {
+      out[key] = cleanSchema(v);
+    }
+  }
+  if (out.properties && !out.type) out.type = 'object';
+  if (!out.type && !out.anyOf && !out.properties) out.type = 'string';
+  return out;
+}
+
+/** Gemini finishReason -> OpenAI finish_reason */
+function mapFinish(reason) {
+  switch (reason) {
+    case 'STOP': return 'stop';
+    case 'MAX_TOKENS': return 'length';
+    case 'SAFETY':
+    case 'RECITATION':
+    case 'BLOCKLIST':
+    case 'PROHIBITED_CONTENT': return 'content_filter';
+    default: return 'stop';
+  }
+}
+
+/** OpenAI messages -> Gemini contents + systemInstruction（含 tools / 函数调用） */
 function toGeminiPayload(openaiBody) {
   const messages = Array.isArray(openaiBody.messages) ? openaiBody.messages : [];
   const contents = [];
   const systemParts = [];
-  for (const m of messages) {
-    if (!m || typeof m.content !== 'string') continue;
-    if (m.role === 'system' || m.role === 'developer') {
-      systemParts.push({ text: m.content });
-    } else {
-      contents.push({
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: m.content }],
-      });
-    }
+  const nameByCallId = {};
+
+  function pushParts(role, parts) {
+    if (!parts.length) return;
+    const last = contents[contents.length - 1];
+    if (last && last.role === role) last.parts.push(...parts);
+    else contents.push({ role, parts });
   }
+
+  for (const m of messages) {
+    if (!m) continue;
+    const role = m.role;
+    if (role === 'system' || role === 'developer') {
+      const t = contentToText(m.content);
+      if (t) systemParts.push({ text: t });
+      continue;
+    }
+    if (role === 'tool' || role === 'function') {
+      const name = m.name || nameByCallId[m.tool_call_id] || 'tool';
+      const raw = contentToText(m.content);
+      let respObj;
+      try { respObj = JSON.parse(raw); } catch (e) { respObj = { result: raw }; }
+      if (respObj === null || typeof respObj !== 'object' || Array.isArray(respObj)) respObj = { result: respObj };
+      pushParts('user', [{ functionResponse: { name, response: respObj } }]);
+      continue;
+    }
+    if (role === 'assistant') {
+      const parts = [];
+      const t = contentToText(m.content);
+      if (t) parts.push({ text: t });
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          const fn = (tc && tc.function) || {};
+          if (!fn.name) continue;
+          let args = {};
+          if (typeof fn.arguments === 'string' && fn.arguments.trim()) {
+            try { args = JSON.parse(fn.arguments); } catch (e) { args = { _raw: fn.arguments }; }
+          } else if (fn.arguments && typeof fn.arguments === 'object') {
+            args = fn.arguments;
+          }
+          if (tc.id) nameByCallId[tc.id] = fn.name;
+          const part = { functionCall: { name: fn.name, args } };
+          const sig = decodeCallId(tc.id);
+          if (sig) part.thoughtSignature = sig;
+          parts.push(part);
+        }
+      }
+      pushParts('model', parts);
+      continue;
+    }
+    const parts = contentToParts(m.content);
+    pushParts('user', parts.length ? parts : [{ text: '' }]);
+  }
+
   const payload = { contents };
   if (systemParts.length) payload.systemInstruction = { parts: systemParts };
   const gc = {};
   if (typeof openaiBody.temperature === 'number') gc.temperature = openaiBody.temperature;
   if (typeof openaiBody.top_p === 'number') gc.topP = openaiBody.top_p;
-  if (typeof openaiBody.max_tokens === 'number' && openaiBody.max_tokens > 0) gc.maxOutputTokens = openaiBody.max_tokens;
+  const maxOut = openaiBody.max_tokens || openaiBody.max_completion_tokens;
+  if (typeof maxOut === 'number' && maxOut > 0) gc.maxOutputTokens = maxOut;
   if (typeof openaiBody.stop === 'string') gc.stopSequences = [openaiBody.stop];
-  if (Array.isArray(openaiBody.stop)) gc.stopSequences = openaiBody.stop;
+  if (Array.isArray(openaiBody.stop)) gc.stopSequences = openaiBody.stop.filter((x) => typeof x === 'string');
+
+  if (Array.isArray(openaiBody.tools) && openaiBody.tools.length) {
+    const decls = [];
+    for (const t of openaiBody.tools) {
+      const fn = t && (t.function || (t.type === 'function' ? t : null));
+      if (!fn || !fn.name) continue;
+      const params = cleanSchema(fn.parameters || { type: 'object', properties: {} });
+      decls.push({
+        name: fn.name,
+        description: fn.description || '',
+        parameters: params && params.type ? params : { type: 'object', properties: {} },
+      });
+    }
+    if (decls.length) payload.tools = [{ functionDeclarations: decls }];
+  }
+  const tcChoice = openaiBody.tool_choice;
+  if (payload.tools && tcChoice !== undefined) {
+    const cfg = { mode: 'AUTO' };
+    if (tcChoice === 'none') cfg.mode = 'NONE';
+    else if (tcChoice === 'required') cfg.mode = 'ANY';
+    else if (tcChoice && typeof tcChoice === 'object' && tcChoice.function && tcChoice.function.name) {
+      cfg.mode = 'ANY';
+      cfg.allowedFunctionNames = [tcChoice.function.name];
+    }
+    payload.toolConfig = { functionCallingConfig: cfg };
+  }
   if (Object.keys(gc).length) payload.generationConfig = gc;
   // 安全设置：全部放宽为 BLOCK_ONLY_HIGH，减少无谓拒答
   payload.safetySettings = [
@@ -80,17 +232,66 @@ function genId() {
   return 'chatcmpl-' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
 }
 
-/** Gemini 非流式响应 -> OpenAI 格式 */
-function toOpenAIResponse(data, model, wantStreamMeta) {
+function genCallId() {
+  return 'call_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+}
+
+/** 把 Gemini thoughtSignature 走私进 OpenAI 的 tool_call id（Gemini 3.x 回放必需） */
+function encodeCallId(sig) {
+  if (!sig) return genCallId();
+  let b64 = '';
+  try {
+    b64 = btoa(String.fromCharCode(...new TextEncoder().encode(String(sig))));
+  } catch (e) {
+    b64 = String(sig);
+  }
+  const u = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return 'call_' + Math.random().toString(36).slice(2, 8) + '_ts_' + u;
+}
+
+function decodeCallId(id) {
+  if (typeof id !== 'string') return null;
+  const i = id.indexOf('_ts_');
+  if (i === -1) return null;
+  let u = id.slice(i + 4).replace(/-/g, '+').replace(/_/g, '/');
+  while (u.length % 4) u += '=';
+  try {
+    const bin = atob(u);
+    const bytes = new Uint8Array(bin.length);
+    for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+    return new TextDecoder().decode(bytes);
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Gemini 非流式响应 -> OpenAI 格式（含 tool_calls） */
+function toOpenAIResponse(data, model) {
   const cand = (data.candidates && data.candidates[0]) || {};
   const parts = (cand.content && cand.content.parts) || [];
   let text = '';
+  const toolCalls = [];
   for (const p of parts) {
     if (typeof p.text === 'string') text += p.text;
+    if (p.functionCall && p.functionCall.name) {
+      toolCalls.push({
+        id: encodeCallId(p.thoughtSignature || p.thought_signature),
+        type: 'function',
+        function: {
+          name: p.functionCall.name,
+          arguments: JSON.stringify(p.functionCall.args || {}),
+        },
+      });
+    }
   }
   if (!text && data.promptFeedback && data.promptFeedback.blockReason) {
     text = `[BLOCKED] ${data.promptFeedback.blockReason}`;
   }
+  const message = { role: 'assistant', content: toolCalls.length ? (text || null) : text };
+  if (toolCalls.length) message.tool_calls = toolCalls;
+  let finish = 'stop';
+  if (toolCalls.length) finish = 'tool_calls';
+  else if (cand.finishReason) finish = mapFinish(cand.finishReason);
   const usage = data.usageMetadata || {};
   return {
     id: genId(),
@@ -100,8 +301,8 @@ function toOpenAIResponse(data, model, wantStreamMeta) {
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content: text },
-        finish_reason: cand.finishReason === 'STOP' ? 'stop' : (cand.finishReason || 'stop').toLowerCase(),
+        message,
+        finish_reason: finish,
       },
     ],
     usage: {
@@ -112,30 +313,45 @@ function toOpenAIResponse(data, model, wantStreamMeta) {
   };
 }
 
-/** Gemini SSE 行 -> OpenAI chunk JSON 字符串数组 */
-function geminiChunkToOpenAI(geminiJson, model) {
+/** Gemini SSE 行 -> OpenAI chunk 字符串（含流式 tool_calls） */
+function geminiChunkToOpenAI(geminiJson, model, state) {
   const cand = (geminiJson.candidates && geminiJson.candidates[0]) || {};
   const parts = (cand.content && cand.content.parts) || [];
   let text = '';
+  const fnCalls = [];
   for (const p of parts) {
     if (typeof p.text === 'string') text += p.text;
+    if (p.functionCall && p.functionCall.name) fnCalls.push({ fc: p.functionCall, sig: p.thoughtSignature || p.thought_signature });
   }
   const usage = geminiJson.usageMetadata || {};
+  const delta = {};
+  if (text) delta.content = text;
+  if (fnCalls.length) {
+    delta.tool_calls = fnCalls.map((item) => {
+      const idx = state.toolCalls++;
+      return {
+        index: idx,
+        id: encodeCallId(item.sig),
+        type: 'function',
+        function: { name: item.fc.name, arguments: JSON.stringify(item.fc.args || {}) },
+      };
+    });
+  }
+  let finish = null;
+  if (cand.finishReason) {
+    if (state.toolCalls > 0) finish = 'tool_calls';
+    else finish = mapFinish(cand.finishReason);
+  }
   const chunk = {
-    id: genId(),
+    id: state.id,
     object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
+    created: state.created,
     model,
     choices: [
       {
         index: 0,
-        delta: text ? { content: text } : {},
-        finish_reason:
-          cand.finishReason && cand.finishReason !== 'STOP'
-            ? cand.finishReason.toLowerCase()
-            : cand.finishReason === 'STOP'
-              ? 'stop'
-              : null,
+        delta,
+        finish_reason: finish,
       },
     ],
   };
@@ -154,6 +370,7 @@ function sseTransform(geminiStream, model) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = '';
+  const state = { id: genId(), created: Math.floor(Date.now() / 1000), toolCalls: 0 };
   return new TransformStream({
     transform(chunk, controller) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -166,7 +383,7 @@ function sseTransform(geminiStream, model) {
         if (!dataStr || dataStr === '[DONE]') continue;
         try {
           const j = JSON.parse(dataStr);
-          controller.enqueue(encoder.encode(geminiChunkToOpenAI(j, model)));
+          controller.enqueue(encoder.encode(geminiChunkToOpenAI(j, model, state)));
         } catch (e) {
           // 忽略无法解析的行
         }
